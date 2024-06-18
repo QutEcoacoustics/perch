@@ -28,9 +28,10 @@ from chirp.inference.classify import data_lib
 
 
 @dataclass
-class AgileModellingConfig:
+class AgileModelingConfig:
     data_source: str = 'ecosounds'
     baw_auth_token: str = None
+    a2o_auth_token: str = None # only for backwards compatibility
     baw_domain: str = 'api.ecosounds.org'
     model_choice: str = 'perch'
     working_dir: Path = None
@@ -53,14 +54,18 @@ class AgileModellingConfig:
       self.labeled_data_path = Path(self.labeled_data_path)
       self.custom_classifier_path = Path(self.custom_classifier_path)
       self.embeddings_path = Path(self.embeddings_path)
+      if self.a2o_auth_token is not None:
+          # allow a2o_auth_token instead of baw_auth_token,
+          # for backwards compatibility
+          self.baw_auth_token = self.a2o_auth_token
       
 
 
 
 
-class AgileModelling:
+class AgileModeling:
 
-  # user config for agile modelling
+  # user config for agile modeling
   config = None
 
   # bootstrap config, project state, and optional separator model
@@ -86,7 +91,7 @@ class AgileModelling:
   wrapped_model: interface.LogitsOutputHead = None
 
 
-  def __init__(self, config: AgileModellingConfig):
+  def __init__(self, config: AgileModelingConfig):
     self.config = config
     self.setup_bootstrap_config()
  
@@ -95,7 +100,7 @@ class AgileModelling:
     """
     Depending on the source of the embeddings, loads a bootsrap config from
     the config associated with the embeddings. 
-    @param config: AgileModellingConfig
+    @param config: AgileModelingConfig
 
     @return: bootstrap.BootstrapState
     """
@@ -510,19 +515,19 @@ class AgileModelling:
     
     if output_filepath is None:
       output_filepath = Path(self.config.working_dir) / 'inference.csv'
+    
+    print(f'Writing to {output_filepath}')
 
-    #@markdown Set the default detection thresholds, used for all classes.
-    #@markdown To set per-class detection thresholds, modify the code below.
-    #@markdown Keep in mind that thresholds are on the logit scale, so 0.0
-    #@markdown corresponds to a 50% model confidence.
 
     if default_threshold is None:
       # In this case, all logits are written. This can lead to very large CSV files.
       class_thresholds = None
-    else:
+    elif class_thresholds is None:
+      # In this case, use the default threshold for all classes
       class_thresholds = collections.defaultdict(lambda: default_threshold)
-      # Add any per-class thresholds here.
-      class_thresholds['my_class'] = 1.0
+    else:
+      # in this case use the default threshold for all classes not in the class_thresholds dict
+      class_thresholds = collections.defaultdict(lambda: default_threshold, class_thresholds)
 
 
     embeddings_ds = self.project_state.create_embeddings_dataset(
@@ -538,10 +543,10 @@ class AgileModelling:
         exclude_classes=exclude_classes)
     
   
-  def prepare_call_density_estimateion(self, 
-                                       target_class: str = None,
-                                       bounds: List[float] = [0.0, 0.9, 0.99, 0.999, 1.0],
-                                       samples_per_bin = 25):
+  def prepare_call_density_estimation(self, 
+                                      target_class: str = None,
+                                      bounds: List[float] = [0.0, 0.9, 0.99, 0.999, 1.0],
+                                      samples_per_bin = 25):
     """
     Prepares things for the call density estimation
     @param target_class: str; Choose the target class to work with.
@@ -652,6 +657,8 @@ class AgileModelling:
 
     log = pd.DataFrame(validation_log)
     log.to_csv(validation_log_filepath, mode='a')
+
+    return validation_log
 
 
 def plot_precision_recall_curves(test_logits_dict, test_labels):
