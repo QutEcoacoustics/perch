@@ -29,6 +29,7 @@ training small classifiers or evaluating clustering methods.
 import collections
 import dataclasses
 import itertools
+import pandas as pd
 import time
 from typing import Dict, Sequence, Tuple
 
@@ -58,8 +59,20 @@ class MergedDataset:
   embedding_dim: int
   labels: Tuple[str, ...]
 
+
   @classmethod
-  def from_folder_of_folders(
+  def from_folder_of_folders(cls, **kwargs):
+    print('Embedding from Folder of Folders...')
+    cls.get_merged_dataset(**kwargs)
+
+  @classmethod
+  def from_csv(cls, **kwargs):
+    print('Embedding from CSV...')
+    cls.get_merged_dataset(**kwargs)
+
+
+  @classmethod
+  def get_merged_dataset(
       cls,
       base_dir: str,
       embedding_model: interface.EmbeddingModel,
@@ -67,13 +80,14 @@ class MergedDataset:
       exclude_classes: Sequence[str] = (),
       load_audio: bool = False,
       target_sample_rate: int = -2,
-      audio_file_pattern: str = '*',
+      audio_file_pattern: str = None,
       embedding_config_hash: str = '',
       embedding_file_prefix: str = 'embeddings-',
       pad_type: str = 'zeros',
       cache_embeddings: bool = True,
       tf_record_shards: int = 1,
       max_workers: int = 5,
+      csv_path = None
   ) -> 'MergedDataset':
     """Generating MergedDataset via folder-of-folders method.
 
@@ -110,14 +124,17 @@ class MergedDataset:
     Returns:
       MergedDataset
     """
-    print('Embedding from Folder of Folders...')
+
+    if csv_path is not None and audio_file_pattern is not None:
+      raise ValueError('Only one of csv_path and audio_file_pattern should be specified.')
+
 
     st = time.time()
 
     existing_merged = None
     existing_embedded_srcs = []
     if embedding_config_hash:
-      print('Checking for existing embeddings from Folder of Folders...')
+      print('Checking for existing embeddings...')
 
       base_path = epath.Path(base_dir)
       embedding_folder = (
@@ -132,21 +149,34 @@ class MergedDataset:
 
       print(f'Found {len(existing_embedded_srcs)} existing embeddings.')
 
-    print('Checking for new sources to embed from Folder of Folders...')
+    
 
+    # call a different embed function depending on whether 
+    # the examples are matched to labels in a csv or by a folder of folders
+    if csv_path is not None:
+      filepaths, example_labels_hot, labels = prepare_embedding_from_csv(csv_path)
+    else:
+      filepaths, example_labels_hot, labels = prepare_embedding_from_folder_of_folders(
+          base_dir = base_dir, 
+          exclude_classes = exclude_classes, 
+          audio_file_pattern = audio_file_pattern, 
+          embedding_file_prefix = embedding_file_prefix)
+    
     labels, merged = embed_dataset(
-        base_dir=base_dir,
-        embedding_model=embedding_model,
-        time_pooling=time_pooling,
-        exclude_classes=exclude_classes,
-        load_audio=load_audio,
-        target_sample_rate=target_sample_rate,
-        audio_file_pattern=audio_file_pattern,
-        excluded_files=existing_embedded_srcs,
-        embedding_file_prefix=embedding_file_prefix,
-        pad_type=pad_type,
-        max_workers=max_workers,
+      base_dir=base_dir,
+      embedding_model=embedding_model,
+      time_pooling=time_pooling,
+      filepaths=filepaths,
+      example_labels_hot=example_labels_hot,
+      labels=labels,
+      excluded_files=existing_embedded_srcs,
+      load_audio=load_audio,
+      target_sample_rate=target_sample_rate,
+      pad_type=pad_type,
+      max_workers=max_workers
     )
+
+
 
     if not merged and existing_merged is None:
       raise ValueError('No embeddings or raw audio files found.')
@@ -463,62 +493,48 @@ def labels_from_folder_of_folders(
 
   return labels
 
-
-def embed_dataset(
-    base_dir: str,
-    embedding_model: interface.EmbeddingModel,
-    time_pooling: str,
-    exclude_classes: Sequence[str] = (),
-    load_audio: bool = False,
-    target_sample_rate: int = -1,
-    audio_file_pattern: str = '*',
-    excluded_files: Sequence[str] = (),
-    embedding_file_prefix: str = 'embeddings-',
-    pad_type: str = 'zeros',
-    max_workers: int = 5,
-) -> Tuple[Sequence[str], Dict[str, np.ndarray]]:
-  """Add embeddings to an eval dataset.
-
-  Embed a dataset, creating an in-memory copy of all data with embeddings added.
-  The base_dir should contain folders corresponding to classes, and each
-  sub-folder should contina audio files for the respective class.
-
-  Note that any audio files in the base_dir directly will be ignored.
-
-  Args:
-    base_dir: Directory contianing audio data.
-    embedding_model: Model for computing audio embeddings.
-    time_pooling: Key for time pooling strategy.
-    exclude_classes: Classes to skip.
-    load_audio: Whether to load audio into memory.
-    target_sample_rate: Resample loaded audio to this sample rate. If -1, loads
-      raw audio with no resampling. If -2, uses the embedding_model sample rate.
-    audio_file_pattern: The glob pattern to use for finding audio files within
-      the sub-folders.
-    excluded_files: These files will be ignored, the paths are assumed to be
-      relative to the base_dir.
-    embedding_file_prefix: Prefix for existing embedding files, matching files
-      will be ignored.
-    pad_type: Padding style for short audio.
-    max_workers: Number of threads to use for loading audio.
-
-  Returns:
-    Ordered labels and a Dict contianing the entire embedded dataset.
+def write_csv_from_folder_of_folders(
+  base_dir: str,
+  exclude_classes: Sequence[str] = (),
+  audio_file_pattern: str = '*.wav',
+  embedding_file_prefix: str = 'embeddings-',
+  labels_csv: str = 'labels.csv'
+):
   """
-  labels = labels_from_folder_of_folders(base_dir, exclude_classes)
-  base_dir = epath.Path(base_dir)
+  Writes a csv of filepaths and labels from a folder of folders
 
-  if hasattr(embedding_model, 'window_size_s'):
-    window_size = int(
-        embedding_model.window_size_s * embedding_model.sample_rate
-    )
-  else:
-    window_size = -1
+  If there is a folder of folders where each folder name is a label, but we want to 
+  change to using a csv to associate labels with files (maybe because we want to 
+  allow multiple labels per example), this function will make this conversion
+  """
 
-  if target_sample_rate == -2:
-    target_sample_rate = embedding_model.sample_rate
+  filepaths, example_labels_hot, labels = prepare_embedding_from_folder_of_folders(
+    base_dir=base_dir, 
+    exclude_classes=exclude_classes, 
+    audio_file_pattern=audio_file_pattern, 
+    embedding_file_prefix=embedding_file_prefix)
+  
+  labels_hot_list = [list(arr) for arr in example_labels_hot]
+  data_dict = {'filepath': filepaths, **{label: [labels_hot_list[i][j] for i in range(len(filepaths))] for j, label in enumerate(labels)}}
+  df = pd.DataFrame(data_dict)
 
-  merged = collections.defaultdict(list)
+  csv_path = epath.Path(base_dir) / epath.Path(labels_csv)
+
+  df.to_csv(csv_path, index=False)
+
+def prepare_embedding_from_folder_of_folders(
+    base_dir: str, 
+    exclude_classes, 
+    audio_file_pattern, 
+    embedding_file_prefix
+    ):
+  
+  print('Checking for new sources to embed from Folder of Folders...')
+  
+  all_filepaths = []
+  all_example_labels_hot = []
+
+  labels = labels_from_folder_of_folders(base_dir, exclude_classes, embedding_file_prefix)
   for label_idx, label in enumerate(labels):
     label_hot = np.zeros([len(labels)], np.int32)
     label_hot[label_idx] = 1
@@ -536,52 +552,150 @@ def embed_dataset(
               audio_file_pattern, base_dir / label
           )
       )
+    
+    all_filepaths = all_filepaths + filepaths
+    all_example_labels_hot = all_example_labels_hot + [label_hot] * len(filepaths)
 
-    filepaths = [
-        fp.as_posix()
-        for fp in filepaths
-        if fp.relative_to(base_dir).as_posix() not in excluded_files
-    ]
+    return all_filepaths, all_example_labels_hot, labels
 
-    audio_loader = lambda fp, offset: _pad_audio(
-        np.asarray(audio_utils.load_audio(fp, target_sample_rate)),
-        window_size,
-        pad_type,
+
+def prepare_embedding_from_csv(labels_csv: str) -> tuple:
+  """
+  Returns a list of filepaths, a list of the one-hot encoded labels file-labels, 
+  and a list of labels 
+  """
+
+  print('Checking for new sources to embed from csv ...')
+
+  # Read the labels csv as a pandas dataframe
+  labels_df = pd.read_csv(labels_csv)
+
+  # labels_df has a column 'filename' and a column for each label. 
+  # The column names are the label names.
+  # the 'filename' column contains the relative path to the audio file.
+  # the label columns contain a 1 if the audio file belongs to that or 0 otherwise.
+
+  # get a list of labels from the column names, making sure
+  # not to include the 'filename' column
+  labels = [col for col in labels_df.columns if col != 'filename']
+
+  # check that labels is in alphabetical order
+  # to avoid mixups we keep the labels in alphabetical order, 
+  # and we also want to keep consistency between the labels in the csv
+  # and how we store them in the embeddings
+  if labels != sorted(labels):
+    raise ValueError('Label columns in csv must be in alphabetical order.')
+
+   # list of hot encodings of the labels for all the examples
+  example_labels_hot = [np.array(row[labels]) for idx, row in labels_df.iterrows()]
+
+  filepaths = [epath.Path(row['filename']).as_posix() for idx, row in labels_df.iterrows()]
+
+  return filepaths, example_labels_hot, labels
+
+
+def embed_dataset(
+    base_dir: str,
+    embedding_model: interface.EmbeddingModel,
+    time_pooling: str,
+    filepaths: list,
+    example_labels_hot: list,
+    labels: list,
+    excluded_files: Sequence[str] = (),
+    load_audio: bool = False,
+    target_sample_rate: int = -1,
+    pad_type: str = 'zeros',
+    max_workers: int = 5,
+) -> Tuple[Sequence[str], Dict[str, np.ndarray]]:
+  """Add embeddings to an eval dataset.
+
+  Embed a dataset, creating an in-memory copy of all data with embeddings added.
+  The base_dir should contain folders corresponding to classes, and each
+  sub-folder should contina audio files for the respective class.
+
+  Note that any audio files in the base_dir directly will be ignored.
+
+  Args:
+    base_dir: Directory contianing audio data.
+    embedding_model: Model for computing audio embeddings.
+    time_pooling: Key for time pooling strategy.
+    labels_csv: CSV file containing the labels for each audio file.
+    load_audio: Whether to load audio into memory.
+    target_sample_rate: Resample loaded audio to this sample rate. If -1, loads
+      raw audio with no resampling. If -2, uses the embedding_model sample rate.
+    pad_type: Padding style for short audio.
+    max_workers: Number of threads to use for loading audio.
+
+  Returns:
+    Ordered labels and a Dict contianing the entire embedded dataset.
+  """
+
+  filepaths = [
+      fp.as_posix()
+      for fp in filepaths
+      if fp.relative_to(base_dir).as_posix() not in excluded_files
+  ]
+  
+
+  base_dir = epath.Path(base_dir)
+
+  if hasattr(embedding_model, 'window_size_s'):
+    window_size = int(
+        embedding_model.window_size_s * embedding_model.sample_rate
     )
-    audio_iterator = audio_utils.multi_load_audio_window(
-        audio_loader=audio_loader,
-        filepaths=filepaths,
-        offsets=None,
-        max_workers=max_workers,
-        buffer_size=64,
+  else:
+    window_size = -1
+
+  if target_sample_rate == -2:
+    target_sample_rate = embedding_model.sample_rate
+
+  merged = collections.defaultdict(list)
+
+  audio_loader = lambda fp, offset: _pad_audio(
+      np.asarray(audio_utils.load_audio(fp, target_sample_rate)),
+      window_size,
+      pad_type,
+  )
+  audio_iterator = audio_utils.multi_load_audio_window(
+      audio_loader=audio_loader,
+      filepaths=filepaths,
+      offsets=None,
+      max_workers=max_workers,
+      buffer_size=64,
+  )
+
+  for idx, audio in enumerate(tqdm.tqdm(audio_iterator)):
+    outputs = embedding_model.embed(audio)
+    if outputs.embeddings is None:
+      raise ValueError('Embedding model did not produce any embeddings!')
+    # If the audio was separated then the raw audio is in the first channel.
+    # Embedding shape is either [B, F, C, D] or [F, C, D] so channel is
+    # always -2.
+    channel_pooling = (
+        'squeeze' if outputs.embeddings.shape[-2] == 1 else 'first'
     )
+    embeds = outputs.pooled_embeddings(time_pooling, channel_pooling)
+    merged['embeddings'].append(embeds)
+    if load_audio:
+      merged['audio'].append(audio)
 
-    for audio in tqdm.tqdm(audio_iterator):
-      outputs = embedding_model.embed(audio)
-      if outputs.embeddings is None:
-        raise ValueError('Embedding model did not produce any embeddings!')
-      # If the audio was separated then the raw audio is in the first channel.
-      # Embedding shape is either [B, F, C, D] or [F, C, D] so channel is
-      # always -2.
-      channel_pooling = (
-          'squeeze' if outputs.embeddings.shape[-2] == 1 else 'first'
-      )
-      embeds = outputs.pooled_embeddings(time_pooling, channel_pooling)
-      merged['embeddings'].append(embeds)
-      if load_audio:
-        merged['audio'].append(audio)
+    label_hot = example_labels_hot[idx]
 
-    for fp in filepaths:
-      filename = epath.Path(fp).name
-      merged['filename'].append(f'{label}/{filename}')
-      merged['label'].append(label_idx)
-      merged['label_str'].append(label)
-      merged['label_hot'].append(label_hot)
+    # get the indexes of all the labels that are 1
+    label_indexes= [idx for idx, val in enumerate(label_hot[idx]) if val == 1]
+    label_strings = [labels[i] for i in label_indexes]
+
+    filename = epath.Path(filepaths[idx]).name
+    merged['filename'].append(filename)
+    merged['label'].append(label_indexes)
+    merged['label_str'].append(label_strings)
+    merged['label_hot'].append(label_hot)
 
   outputs = {}
   for k in merged.keys():
     outputs[k] = np.stack(merged[k])
   return labels, outputs
+
 
 
 def read_embedded_dataset(
