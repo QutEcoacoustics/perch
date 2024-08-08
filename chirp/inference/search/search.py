@@ -344,7 +344,7 @@ def classifer_search_embeddings_parallel(
     input_specs = signature.structured_input_signature[1]
     model_input_dtype = list(input_specs.values())[0].dtype
   else:
-    model_input_dtype = embeddings_classifier.logits_model.input.dtype
+    model_input_dtype = embeddings_classifier.logits_model.layers[0].dtype
 
   def classify_batch(batch, query_embedding_batch):
     del query_embedding_batch

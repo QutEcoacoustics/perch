@@ -40,6 +40,7 @@ class AgileModelingConfig:
     embeddings_path: Path = None 
     separation_model_key: str = ''
     separation_model_path: str = ''
+    label_csv: str = None
 
     def __post_init__(self):
       # fields derived from other fields must be set here
@@ -298,14 +299,15 @@ class AgileModeling:
   def embed_labelled_set(self, 
                          time_pooling='mean'):
 
-    merged = data_lib.MergedDataset.from_folder_of_folders(
+    merged = data_lib.MergedDataset.get_merged_dataset(
         base_dir=self.config.labeled_data_path,
         embedding_model=self.project_state.embedding_model,
         time_pooling=time_pooling,
         load_audio=False,
         target_sample_rate=-2,
-        audio_file_pattern='*',
+        audio_file_pattern="*",
         embedding_config_hash=self.bootstrap_config.embedding_config_hash(),
+        label_csv = self.config.label_csv
     )
 
     # Label distribution
@@ -343,7 +345,7 @@ class AgileModeling:
     for seed in tqdm.tqdm(range(num_seeds)):
       if num_hiddens > 0:
         model = classify.get_two_layer_model(
-            num_hiddens, self.merged.embedding_dim, self.merged.num_classes)
+            num_hiddens, self.merged.embedding_dim, self.merged.num_classes, batch_norm=True, dtype=self.bootstrap_config.tensor_dtype)
       else:
         model = classify.get_linear_model(
             self.merged.embedding_dim, self.merged.num_classes, self.bootstrap_config.tensor_dtype)
@@ -466,7 +468,6 @@ class AgileModeling:
       display_labels = [display_labels]
 
     #@markdown Specify any extra labels you would like displayed.
-    extra_labels = []  #@param
     for label in extra_labels:
       if label not in display_labels:
         display_labels += (label,)

@@ -35,12 +35,16 @@ class ClassifierMetrics:
   cmap_value: float
   class_maps: dict[str, float]
   test_logits: dict[str, np.ndarray]
+  hamming_acc: float = None
+  total_acc: float = None
 
 
 def get_two_layer_model(
     num_hiddens: int, embedding_dim: int, num_classes: int, batch_norm: bool, dtype: str='float32'
 ) -> tf.keras.Model:
   """Create a simple two-layer Keras model."""
+
+  # the dtype might get ignored due to tensorflow's mixed precision policy??
   layers = [tf.keras.Input(shape=[embedding_dim], dtype=tf.dtypes.as_dtype(dtype))]
   if batch_norm:
     layers.append(tf.keras.layers.BatchNormalization())
@@ -110,28 +114,43 @@ def train_from_locs(
   test_features = merged.data['embeddings'][test_locs]
   test_logits = model.predict(test_features, verbose=0, batch_size=8)
   test_labels_hot = merged.data['label_hot'][test_locs]
-  test_labels = merged.data['label'][test_locs]
+  test_labels = [merged.data['label'][i] for i in test_locs]
 
   # Create a dictionary of test logits for each class.
   test_logits_dict = {}
-  for k in set(test_labels):
-    lbl_locs = np.argwhere(test_labels == k)[:, 0]
+  test_labels_flat = [l for ex in test_labels for l in ex]
+  for k in set(test_labels_flat):
+    lbl_locs = np.argwhere(test_labels_hot[:,k])[:, 0]
     test_logits_dict[k] = test_logits[lbl_locs, k]
 
-  top_logit_idxs = np.argmax(test_logits, axis=1)
-  top1acc = np.mean(test_labels == top_logit_idxs)
+  # top_logit_idxs = np.argmax(test_logits, axis=1) # this is not really relevant for multlabel metrics
+  # top1acc = np.mean([top_logit_idxs[i] in ex_labels for i, ex_labels in enumerate(test_labels)])
   # TODO(tomdenton): Implement recall@precision metric.
   recall = -1.0
 
+  lwlrap_score = calculate_lwlrap(test_labels_hot, test_logits)
+
   cmap_value = metrics.cmap(test_logits, test_labels_hot)['macro']
   auc_roc = metrics.roc_auc(test_logits, test_labels_hot)
+
+  test_predictions = tf.cast(tf.sigmoid(test_logits) > 0.5, tf.int32)
+
+  # Hamming loss is the fraction of the wrong labels to the total number of labels
+  # hamming accuracy is what we will call one minus the hamming loss, to be consistent with other metrics
+  hamming_acc = tf.reduce_mean(tf.cast(tf.equal(test_predictions, tf.cast(test_labels_hot, tf.int32)), tf.float32))
+
+  # total accuracy. The fraction of examples that have all labels correctly classified
+  total_acc = tf.reduce_mean(tf.cast(tf.reduce_all(tf.equal(test_predictions, tf.cast(test_labels_hot, tf.int32)), axis=1), tf.float32))
+
   return ClassifierMetrics(
-      top1acc,
+      lwlrap_score, # top1acc is equivalent to lwrap_score for single label
       auc_roc['macro'],
       recall,
       cmap_value,
       auc_roc['individual'],
       test_logits_dict,
+      hamming_acc,
+      total_acc,
   )
 
 
@@ -230,3 +249,43 @@ def write_inference_csv(
             nondetection_count += 1
   print('\n\n\n   Detection count: ', detection_count)
   print('NonDetection count: ', nondetection_count)
+
+
+def calculate_lwlrap(true_labels, predicted_scores) -> float:
+    """
+    Calculate the Label Weighted Label Ranking Average Precision (LWLRAP).
+
+    Args:
+      true_labels: np.array, shape = [num_samples, num_classes], binary indicator matrix of ground truth labels.
+      predicted_scores: np.array, shape = [num_samples, num_classes], the predicted scores or probabilities for each class.
+    
+    Returns:
+      lwlrap: float, the Label Weighted Label Ranking Average Precision (LWLRAP).
+    
+    """
+    num_samples, num_classes = true_labels.shape
+    # for each row, gives the sort order of teh logits.
+    # e.g. sorted_label_idxs[1,2] is the label index for the label that was the 3rd highest for the 2nd sample
+    # e.g. sorted_label_idxs[1,0] is the label index for the label that was the highest for the 2nd sample    
+    sorted_label_idxs = np.argsort(-predicted_scores, axis=1)
+    # Initialize arrays to hold the precision scores for each sample and class.
+    precisions = np.zeros_like(true_labels, dtype=np.float32)
+    # Calculate precision for each class and sample.
+    for sample_idx, label_idxs in enumerate(sorted_label_idxs):
+        true_label_idxs = np.where(true_labels[sample_idx])[0]
+        num_true_labels = len(true_label_idxs)
+        for rank, label_idx in enumerate(label_idxs):
+            if label_idx in true_label_idxs:
+                # Calculate precision up to the current label rank.
+                num_correct = len(set(label_idxs[:rank+1]) & set(true_label_idxs))
+                precisions[sample_idx, label_idx] = num_correct / (rank + 1)
+
+    # precisions now holds an array where each row is a sample, and each column is a label
+    # If the value of a cell is 1, it means that that label was in the top k labels (sorted by logit) 
+    # for that sample, where k is the number of true labels for that sample
+    
+    # Calculate the score for each sample.
+    sample_scores = np.sum(precisions, axis=1) / np.maximum(1, np.sum(true_labels, axis=1))
+    # Calculate the overall score.
+    overall_lwlrap = np.sum(sample_scores) / num_samples
+    return overall_lwlrap

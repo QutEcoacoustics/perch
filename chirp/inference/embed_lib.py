@@ -19,7 +19,8 @@ import dataclasses
 import importlib
 import json
 import os
-from typing import Any, Sequence, Set
+from pathlib import Path
+from typing import Any, Sequence, Set, Tuple, Union
 
 from absl import logging
 import apache_beam as beam
@@ -65,7 +66,7 @@ class SourceId:
 
 
 def create_source_infos(
-    source_file_patterns: Sequence[str],
+    source_file_patterns: Sequence[Union[str, Tuple[str, str]]],
     shard_len_s: float,
     num_shards_per_file: int = -1,
     start_shard_idx: int = 0,
@@ -84,7 +85,13 @@ def create_source_infos(
   """
   source_files = []
   for pattern in source_file_patterns:
-    for source_file in epath.Path('').glob(pattern):
+    #pattern can be either a string to glob or a 
+    # already prepared glob
+    if type(pattern) is str:
+      glob = epath.Path('').glob(pattern)
+    elif type(pattern) is tuple:
+      glob = Path(pattern[0]).rglob(pattern[1])
+    for source_file in glob:
       source_files.append(source_file)
 
   source_file_splits = []

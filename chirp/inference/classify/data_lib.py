@@ -31,7 +31,7 @@ import dataclasses
 import itertools
 import pandas as pd
 import time
-from typing import Dict, Sequence, Tuple
+from typing import DefaultDict, Dict, List, Sequence, Tuple
 
 from chirp import audio_utils
 from chirp.inference import interface
@@ -40,6 +40,27 @@ from etils import epath
 import numpy as np
 import tensorflow as tf
 import tqdm
+
+@dataclasses.dataclass
+class LabelInfo:
+  """Container for label information for a single example"""
+  hot: np.ndarray[int]
+  idx: List[int]
+  name: List[str]
+
+  @classmethod
+  def from_hot(cls, hot: np.ndarray[int], labels: List[str]) -> 'LabelInfo':
+    idx = list(np.where(hot == 1)[0])
+    name = [labels[i] for i in idx]
+    return cls(hot=hot, idx=idx, name=name)
+  
+  @classmethod
+  def from_idx(cls, idx: List[int], labels: List[str]) -> 'LabelInfo':
+    hot = np.zeros(len(labels), np.int32)
+    name = [labels[i] for i in idx]
+    for i in idx:
+      hot[i] = 1
+    return cls(hot=hot, idx=idx, name=name)
 
 
 @dataclasses.dataclass
@@ -62,13 +83,19 @@ class MergedDataset:
 
   @classmethod
   def from_folder_of_folders(cls, **kwargs):
+    """
+    Get a merged dataset from folder of folders. 
+
+    This is primarily here for backwards compatibility.
+    """
     print('Embedding from Folder of Folders...')
-    cls.get_merged_dataset(**kwargs)
+    kwargs['label_csv'] = None
+    return cls.get_merged_dataset(**kwargs)
 
   @classmethod
   def from_csv(cls, **kwargs):
     print('Embedding from CSV...')
-    cls.get_merged_dataset(**kwargs)
+    return cls.get_merged_dataset(**kwargs)
 
 
   @classmethod
@@ -87,7 +114,7 @@ class MergedDataset:
       cache_embeddings: bool = True,
       tf_record_shards: int = 1,
       max_workers: int = 5,
-      csv_path = None
+      label_csv = None
   ) -> 'MergedDataset':
     """Generating MergedDataset via folder-of-folders method.
 
@@ -125,8 +152,8 @@ class MergedDataset:
       MergedDataset
     """
 
-    if csv_path is not None and audio_file_pattern is not None:
-      raise ValueError('Only one of csv_path and audio_file_pattern should be specified.')
+    # if label_csv is not None and audio_file_pattern is not None:
+    #   raise ValueError('Only one of csv_path and audio_file_pattern should be specified.')
 
 
     st = time.time()
@@ -143,7 +170,7 @@ class MergedDataset:
 
       if embedding_folder.exists() and any(embedding_folder.iterdir()):
         existing_merged = cls.from_tfrecords(
-            base_dir, embedding_folder.as_posix(), time_pooling, exclude_classes
+            base_dir, embedding_folder.as_posix(), time_pooling, exclude_classes, label_csv
         )
         existing_embedded_srcs = existing_merged.data['filename']
 
@@ -151,12 +178,17 @@ class MergedDataset:
 
     
 
-    # call a different embed function depending on whether 
-    # the examples are matched to labels in a csv or by a folder of folders
-    if csv_path is not None:
-      filepaths, example_labels_hot, labels = prepare_embedding_from_csv(csv_path)
+    # depending on whether we are using folder-of-folders or csv
+    # we will get the filepaths, example_labels, and labels in different ways
+    if label_csv is not None:
+      file_labels, labels = file_labels_from_csv(label_csv)
+      # check that the filepaths exist 
+      for fp in file_labels.keys():
+        if not (base_dir / fp).exists():
+          raise ValueError(f'Filepath {fp} does not exist.')
+      
     else:
-      filepaths, example_labels_hot, labels = prepare_embedding_from_folder_of_folders(
+      file_labels, labels = file_labels_from_folder_of_folders(
           base_dir = base_dir, 
           exclude_classes = exclude_classes, 
           audio_file_pattern = audio_file_pattern, 
@@ -166,8 +198,7 @@ class MergedDataset:
       base_dir=base_dir,
       embedding_model=embedding_model,
       time_pooling=time_pooling,
-      filepaths=filepaths,
-      example_labels_hot=example_labels_hot,
+      file_labels=file_labels,
       labels=labels,
       excluded_files=existing_embedded_srcs,
       load_audio=load_audio,
@@ -193,11 +224,8 @@ class MergedDataset:
     labels = tuple(labels)
     num_classes = len(labels)
     print(f'    found {num_classes} classes.')
-    class_counts = collections.defaultdict(int)
-    for cl, cl_str in zip(merged['label'], merged['label_str']):
-      class_counts[(cl, cl_str)] += 1
-    for (cl, cl_str), count in sorted(class_counts.items()):
-      print(f'    class {cl_str} / {cl} : {count}')
+    
+    get_class_counts(merged['label'], merged['label_str'])
     new_merged = cls(
         data=data,
         embedding_dim=embedding_dim,
@@ -230,6 +258,7 @@ class MergedDataset:
       embeddings_path: str,
       time_pooling: str,
       exclude_classes: Sequence[str] = (),
+      label_csv: str = None
   ) -> 'MergedDataset':
     """Generating MergedDataset via reading existing embeddings.
 
@@ -242,6 +271,8 @@ class MergedDataset:
       embeddings_path: Location of the existing embeddings.
       time_pooling: Method of time pooling.
       exclude_classes: List of classes to exclude.
+      csv_path: Path to a csv file containing the labels for each audio file. If None
+                will assume labels are derived from folder of folders
 
     Returns:
       MergedDataset
@@ -251,6 +282,7 @@ class MergedDataset:
         embeddings_path=embeddings_path,
         time_pooling=time_pooling,
         exclude_classes=exclude_classes,
+        label_csv=label_csv
     )
     data = merged
     embedding_dim = merged['embeddings'].shape[-1]
@@ -258,11 +290,10 @@ class MergedDataset:
     labels = tuple(labels)
     num_classes = len(labels)
     print(f'    found {num_classes} classes.')
-    class_counts = collections.defaultdict(int)
-    for cl, cl_str in zip(merged['label'], merged['label_str']):
-      class_counts[(cl, cl_str)] += 1
-    for (cl, cl_str), count in sorted(class_counts.items()):
-      print(f'    class {cl_str} / {cl} : {count}')
+
+    get_class_counts(merged['label'], merged['label_str'])
+
+
     return cls(
         data=data,
         embedding_dim=embedding_dim,
@@ -302,7 +333,10 @@ class MergedDataset:
 
     for key in merged_datasets[0].data.keys():
       data_arrays = [merged_data.data[key] for merged_data in merged_datasets]
-      data[key] = np.concatenate(data_arrays)
+      if type(data_arrays[0]) is list:
+        data[key] = [item for sublist in data_arrays for item in sublist]
+      else:
+        data[key] = np.concatenate(data_arrays)
 
     return cls(
         data=data,
@@ -375,7 +409,32 @@ class MergedDataset:
       exclude_classes: Sequence[int] = (),
       exclude_eval_classes: Sequence[int] = (),
   ):
-    """Generate a train/test split with a target number of train examples."""
+    """
+    Generate a train/test split with a target number of train examples.
+
+    Args:
+      train_ratio: Ratio of examples to use for training.
+      train_examples_per_class: Number of examples to use for training.
+      seed: Random seed for splitting.
+      exclude_classes: Classes to exclude from training.
+      exclude_eval_classes: Classes to exclude from evaluation.
+
+    Returns:
+      Tuple of train_locs, test_locs, class_locs.
+
+      Class locs is a mapping labels to the indexes that contain that label. This may
+      Sum to more than the number of examples if there are multiple labels per example.
+
+    In the case that examples have more than one label, this might result in
+    not enough test examples for some classes depending on the nature of the dataset. 
+    This is because we first calculate the number of training examples needed for each class.
+    Then for each example we add it to the training splt if any of its classes have not reached the
+    target number of training examples, otherwise it goes in the test split. If it just happens that
+    a particular class reaches its target number of training examples, and then further examples for that
+    class also belong to another class that has not reached its training target, then those examples
+    will also go in the training set. 
+    
+    """
     if train_ratio is None and train_examples_per_class is None:
       raise ValueError(
           'Must specify one of train_ratio and examples_per_class.'
@@ -386,29 +445,36 @@ class MergedDataset:
       )
 
     # Use a seeded shuffle to get a random ordering of the data.
-    locs = list(range(self.data['label'].shape[0]))
+    locs = list(range(len(self.data['label'])))
     np.random.seed(seed)
     np.random.shuffle(locs)
 
-    classes = set(self.data['label'])
-    class_counts = {cl: np.sum(self.data['label'] == cl) for cl in classes}
+    flattened_labels = [l for ex in self.data['label'] for l in ex]
+    classes = set(flattened_labels)
+    class_counts = {cl: flattened_labels.count(cl) for cl in classes}
     if train_examples_per_class is not None:
       class_limits = {cl: train_examples_per_class for cl in classes}
     else:
       class_limits = {cl: train_ratio * class_counts[cl] for cl in classes}
 
-    classes = set(self.data['label'])
+    
     class_locs = {cl: [] for cl in classes}
     train_locs = []
     test_locs = []
     for loc in locs:
-      cl = self.data['label'][loc]
-      if cl in exclude_classes:
+      item_labels = self.data['label'][loc]
+      # we exclude an item if any of its labels are in exclude_classes
+      if any(exclude_item in item_labels for exclude_item in exclude_classes):
         continue
-      if len(class_locs[cl]) < class_limits[cl]:
-        class_locs[cl].append(loc)
+
+      for cl in item_labels:
+        use_for_train = False
+        if len(class_locs[cl]) < class_limits[cl]:
+          class_locs[cl].append(loc)
+          use_for_train = True
+      if use_for_train:
         train_locs.append(loc)
-      elif cl not in exclude_eval_classes:
+      elif not any(exclude_item in item_labels for exclude_item in exclude_eval_classes):
         test_locs.append(loc)
     train_locs = np.array(train_locs)
     test_locs = np.array(test_locs)
@@ -498,50 +564,131 @@ def write_csv_from_folder_of_folders(
   exclude_classes: Sequence[str] = (),
   audio_file_pattern: str = '*.wav',
   embedding_file_prefix: str = 'embeddings-',
-  labels_csv: str = 'labels.csv'
+  labels_csv: str = 'labels.csv',
+  merge_matching_basename: bool = True
 ):
   """
   Writes a csv of filepaths and labels from a folder of folders
 
+  Args:
+    base_dir: str; the base directory containing the folder of folders
+    exclude_classes: Sequence[str]; a list of classes to exclude
+    audio_file_pattern: str; a glob pattern to use for finding audio files within the sub-folders
+    embedding_file_prefix: str; the prefix for existing materialized embedding files. 
+                                Embeddings with a matching hash will be re-used to avoid reprocessing,
+                                and embeddings with a non-matching hash will be ignored.
+    labels_csv: str; the name of the csv file to write the labels to
+    merge_matching_basename: bool; whether to merge labels if the basename is the same. 
+                                   If folder of folder has been used and examples containing more than one label have been
+                                   duplicated to more than one folder, this will merge the labels into one row, referencing only 
+                                   one copy of the example files. 
+
   If there is a folder of folders where each folder name is a label, but we want to 
   change to using a csv to associate labels with files (maybe because we want to 
-  allow multiple labels per example), this function will make this conversion
+  allow multiple labels per example), this function will make this conversion.
   """
 
-  filepaths, example_labels_hot, labels = prepare_embedding_from_folder_of_folders(
+  example_labels, labels = file_labels_from_folder_of_folders(
     base_dir=base_dir, 
     exclude_classes=exclude_classes, 
     audio_file_pattern=audio_file_pattern, 
     embedding_file_prefix=embedding_file_prefix)
   
-  labels_hot_list = [list(arr) for arr in example_labels_hot]
-  data_dict = {'filepath': filepaths, **{label: [labels_hot_list[i][j] for i in range(len(filepaths))] for j, label in enumerate(labels)}}
+  labels_hot_list = [ex.hot for ex in example_labels.values()]
+  # convert to a dict where there is a key:value for each label, with the key being the label name and the value being a list of
+  # whether the example has that label or not
+  data_dict = {'filepath': example_labels.keys(), **{label: [labels_hot_list[i][j] for i in range(len(example_labels))] for j, label in enumerate(labels)}}
   df = pd.DataFrame(data_dict)
+
+  if merge_matching_basename:
+
+    # merge labels if the basename is the same. Multiple labels per example may have been captured by duplicating the 
+    # example file into more than one subfolder. In this case, we keep the first file and add the labels from the other matching files
+    # to that row. 
+
+    # temp basename column for grouping, which is dropped later
+    df['basename'] = df['filepath'].apply(lambda x: epath.Path(x).name)
+    df = df.groupby('basename').agg({**{'filepath': 'first'}, **{col: 'sum' for col in labels}}).reset_index(drop=True)
+    df.drop(columns=['basename'], inplace=True, errors='ignore')
+
 
   csv_path = epath.Path(base_dir) / epath.Path(labels_csv)
 
   df.to_csv(csv_path, index=False)
 
-def prepare_embedding_from_folder_of_folders(
+
+def labels_from_filelist(filelist: Sequence[str], labels = None) -> Tuple[Dict[epath.Path, LabelInfo], Sequence[str]]:
+  """
+  Returns the labels from a list of filepaths, assuming that the first part of the path is the label.
+
+  Args:
+    filelist: Sequence[str]; a list of filepaths
+    labels: Sequence[str]; a list of labels to use. If None, the labels will be inferred from the filepaths
+
+  Returns:
+    a dictionary of filepaths to labels
+    labels: Sequence[str]; a list of labels.
+  
+  This is relevant only to single-label classification based on folder-of-folders. 
+  The labels argument is so that the label indexes and one-hot encoding can include classes that are not
+  present in the filelist.
+  """
+
+  example_labels_str = [epath.Path(fp).parts[0] for fp in filelist]
+
+  if labels is None:
+    labels = set(example_labels_str)
+  label_dict = get_label_dict(labels)
+
+  # beware that label dicts are references to the same object for the same label
+  example_labels = [label_dict[label] for label in example_labels_str]
+
+  example_labels = dict(zip(filelist, example_labels))
+
+  return example_labels, labels
+   
+   
+  
+
+def file_labels_from_folder_of_folders(
     base_dir: str, 
-    exclude_classes, 
-    audio_file_pattern, 
-    embedding_file_prefix
-    ):
+    exclude_classes: Sequence[str] = (), 
+    audio_file_pattern: str = '*',
+    embedding_file_prefix: str = 'embeddings-',
+    ) -> Tuple[Dict[epath.Path, LabelInfo], Sequence[str]]:
+  """
+  Gets the filepaths and associated labels based on a folder of folders
+
+  Args:
+    base_dir: str;  the base directory containing the folder of folders
+    exclude_classes: Sequence[str]; a list of classes to exclude
+    audio_file_pattern: str; a glob pattern to use for finding audio files within the sub-folders
+    embedding_file_prefix: str;  the prefix for existing materialized embedding files. 
+                                Embeddings with a matching hash will be re-used to avoid reprocessing,
+                                and embeddings with a non-matching hash will be ignored.
+
+  Returns:
+    - a mapping of filepaths to labels
+    - a list of labels
+  
+  The filepath will be relative to the base directory, and therefore the first part of the
+  path with be a folder name that is the label for the example. 
+  The embedding_file_prefix is only there so that the embeddings folder is not included in the labels.
+  
+  """
   
   print('Checking for new sources to embed from Folder of Folders...')
+
+  base_dir = epath.Path(base_dir)
   
   all_filepaths = []
-  all_example_labels_hot = []
 
   labels = labels_from_folder_of_folders(base_dir, exclude_classes, embedding_file_prefix)
-  for label_idx, label in enumerate(labels):
-    label_hot = np.zeros([len(labels)], np.int32)
-    label_hot[label_idx] = 1
+  for label in labels:
 
     # Get filepaths excluding embedding files
     filepaths = [
-        fp
+        fp.relative_to(base_dir)
         for fp in (base_dir / label).glob(audio_file_pattern)
         if not fp.name.startswith(embedding_file_prefix)
     ]
@@ -554,15 +701,23 @@ def prepare_embedding_from_folder_of_folders(
       )
     
     all_filepaths = all_filepaths + filepaths
-    all_example_labels_hot = all_example_labels_hot + [label_hot] * len(filepaths)
+  
+  file_labels, labels = labels_from_filelist(all_filepaths, labels)
 
-    return all_filepaths, all_example_labels_hot, labels
+  return file_labels, labels
 
 
-def prepare_embedding_from_csv(labels_csv: str) -> tuple:
+def file_labels_from_csv(labels_csv: str) -> Tuple[Dict[epath.Path, LabelInfo], Sequence[str]]:
   """
-  Returns a list of filepaths, a list of the one-hot encoded labels file-labels, 
-  and a list of labels 
+  Creates a dict mapping filepaths to their labels, and a list of labels
+
+  Args:
+    labels_csv: the path to the csv file containing the labels
+
+  Returns:
+    a list of filepaths mapped to labels
+    a list of labels
+
   """
 
   print('Checking for new sources to embed from csv ...')
@@ -577,7 +732,7 @@ def prepare_embedding_from_csv(labels_csv: str) -> tuple:
 
   # get a list of labels from the column names, making sure
   # not to include the 'filename' column
-  labels = [col for col in labels_df.columns if col != 'filename']
+  labels = [col for col in labels_df.columns if col != 'filepath']
 
   # check that labels is in alphabetical order
   # to avoid mixups we keep the labels in alphabetical order, 
@@ -586,20 +741,22 @@ def prepare_embedding_from_csv(labels_csv: str) -> tuple:
   if labels != sorted(labels):
     raise ValueError('Label columns in csv must be in alphabetical order.')
 
-   # list of hot encodings of the labels for all the examples
-  example_labels_hot = [np.array(row[labels]) for idx, row in labels_df.iterrows()]
+  example_labels = [
+    LabelInfo.from_hot(np.array(row[labels], np.int32), labels) 
+    for idx, row in labels_df.iterrows()
+  ]
 
-  filepaths = [epath.Path(row['filename']).as_posix() for idx, row in labels_df.iterrows()]
+  filepaths = [epath.Path(row['filepath']) for idx, row in labels_df.iterrows()]
+  example_labels = dict(zip(filepaths, example_labels))
 
-  return filepaths, example_labels_hot, labels
+  return example_labels, labels
 
 
 def embed_dataset(
     base_dir: str,
     embedding_model: interface.EmbeddingModel,
     time_pooling: str,
-    filepaths: list,
-    example_labels_hot: list,
+    file_labels: list,
     labels: list,
     excluded_files: Sequence[str] = (),
     load_audio: bool = False,
@@ -630,13 +787,14 @@ def embed_dataset(
     Ordered labels and a Dict contianing the entire embedded dataset.
   """
 
-  filepaths = [
-      fp.as_posix()
-      for fp in filepaths
-      if fp.relative_to(base_dir).as_posix() not in excluded_files
-  ]
-  
+  file_labels = {
+      fp.as_posix(): v 
+      for fp, v in file_labels.items() 
+      if fp.as_posix() not in excluded_files
+  }
 
+  print(f'Embedding {len(file_labels)} files...')
+  
   base_dir = epath.Path(base_dir)
 
   if hasattr(embedding_model, 'window_size_s'):
@@ -656,13 +814,18 @@ def embed_dataset(
       window_size,
       pad_type,
   )
+
+  full_file_paths = [base_dir / epath.Path(fp) for fp in file_labels.keys()]
   audio_iterator = audio_utils.multi_load_audio_window(
       audio_loader=audio_loader,
-      filepaths=filepaths,
+      filepaths=full_file_paths,
       offsets=None,
       max_workers=max_workers,
       buffer_size=64,
   )
+
+  filepaths = list(file_labels.keys())
+  example_labels = list(file_labels.values())
 
   for idx, audio in enumerate(tqdm.tqdm(audio_iterator)):
     outputs = embedding_model.embed(audio)
@@ -679,21 +842,22 @@ def embed_dataset(
     if load_audio:
       merged['audio'].append(audio)
 
-    label_hot = example_labels_hot[idx]
-
-    # get the indexes of all the labels that are 1
-    label_indexes= [idx for idx, val in enumerate(label_hot[idx]) if val == 1]
-    label_strings = [labels[i] for i in label_indexes]
-
-    filename = epath.Path(filepaths[idx]).name
-    merged['filename'].append(filename)
-    merged['label'].append(label_indexes)
-    merged['label_str'].append(label_strings)
-    merged['label_hot'].append(label_hot)
+    merged['filename'].append(filepaths[idx])
+    merged['label'].append(example_labels[idx].idx)
+    merged['label_str'].append(example_labels[idx].name)
+    merged['label_hot'].append(example_labels[idx].hot)
 
   outputs = {}
+
+
   for k in merged.keys():
-    outputs[k] = np.stack(merged[k])
+    if k in ['label_str', 'label']:
+      # we don't want to np.stack label_str or label because 
+      # they are variable length depending on how many labels are present in each example
+      outputs[k] = merged[k]
+    else:
+      outputs[k] = np.stack(merged[k])
+
   return labels, outputs
 
 
@@ -704,6 +868,7 @@ def read_embedded_dataset(
     time_pooling: str,
     exclude_classes: Sequence[str] = (),
     tensor_dtype: str = 'float32',
+    label_csv: str = None
 ):
   """Read pre-saved embeddings to memory from storage.
 
@@ -713,8 +878,8 @@ def read_embedded_dataset(
   produces the same output as embed_dataset(), except (for now) we don't allow
   for the optional loading of the audio (.wav files). However, for labeled data,
   we still require the base directory containing the folder-of-folders with the
-  audio data to produce the labels. If there are no subfolders, no labels will
-  be created.
+  audio data to produce the labels, or a csv providing the labels. 
+  If there are no subfolders or csv, no labels will be created.
 
   Args:
     base_dir: Base directory where audio may be stored in a subdirectories,
@@ -723,6 +888,8 @@ def read_embedded_dataset(
     time_pooling: Method of time pooling.
     exclude_classes: List of classes to exclude.
     tensor_dtype: Tensor dtype used in the embeddings tfrecords.
+    label_csv: Path to a csv file containing the labels for each audio file. If None
+               will assume labels are derived from folder of folders
 
   Returns:
     Ordered labels and a Dict contianing the entire embedded dataset.
@@ -734,19 +901,24 @@ def read_embedded_dataset(
   parser = tf_examples.get_example_parser(tensor_dtype=tensor_dtype)
   ds = ds.map(parser)
 
-  labels = labels_from_folder_of_folders(base_dir, exclude_classes)
+  # if we are using folder-of-folders for labels the set of all labels comes from
+  # the folder names in base_dir, and the label for each example comes from the 
+  # first part of the path stored with the tf record
+  # If we are using the csv for labels, the set of all labels and the labels for each
+  # example comes from the csv file
+  if label_csv is None:
+    labels = labels_from_folder_of_folders(base_dir, exclude_classes)
+    label_dict = get_label_dict(labels)
+    # label name is the top level folder in the path
+    get_label = lambda ex: label_dict[ex['filename'].decode().split('/')[0]]
+  else:
+    file_labels, labels = file_labels_from_csv(label_csv)
+    # TODO: this will key error if the previously embedded example no longer exists in 
+    # the csv. We need to handle this
+    get_label = lambda ex: file_labels[epath.Path(ex['filename'].decode())]
 
   merged = collections.defaultdict(list)
-  label_dict = collections.defaultdict(dict)
-
-  for label_idx, label in enumerate(labels):
-    label_hot = np.zeros([len(labels)], np.int32)
-    label_hot[label_idx] = 1
-
-    label_dict[label]['label_hot'] = label_hot
-    label_dict[label]['label_idx'] = label_idx
-    label_dict[label]['label_str'] = label
-
+  
   for ex in ds.as_numpy_iterator():
     # Embedding has already been pooled into single dim.
     if len(ex['embedding'].shape) == 1:
@@ -761,12 +933,61 @@ def read_embedded_dataset(
 
     merged['embeddings'].append(outputs)
     merged['filename'].append(ex['filename'].decode())
-    file_label = ex['filename'].decode().split('/')[0]
-    merged['label'].append(label_dict[file_label]['label_idx'])
-    merged['label_str'].append(label_dict[file_label]['label_str'])
-    merged['label_hot'].append(label_dict[file_label]['label_hot'])
+    merged['label'].append(get_label(ex).idx)
+    merged['label_str'].append(get_label(ex).name)
+    merged['label_hot'].append(get_label(ex).hot)
 
   outputs = {}
   for k in merged.keys():
-    outputs[k] = np.stack(merged[k])
+    if k in ['label_str', 'label']:
+      # we don't want to np.stack label_str or label because 
+      # they are variable length depending on how many labels are present in each example
+      outputs[k] = merged[k]
+    else:
+      outputs[k] = np.stack(merged[k])
+  
   return labels, outputs
+
+
+
+def get_label_dict(labels) -> DefaultDict[str, LabelInfo]:
+  """
+  Creates a set of labels for single label classification
+  idx and str are lists of length one to allow compatibility with multilabel datasets
+  """
+
+  label_dict = collections.defaultdict(dict)
+  for label_idx, label in enumerate(labels):
+    label_dict[label] = LabelInfo.from_idx([label_idx], labels)
+
+  return label_dict
+
+
+def get_class_counts(
+    labels_idx: list[list[int]], 
+    labels_str: list[list[str]]) -> DefaultDict[Tuple[int, str], int]:
+  """
+  Gets the number of examples per class as a defaultdict
+  where the key is a tuple of label index and label string
+  and the value is the count of examples in that class. 
+
+  Args:
+    label: list of lists label indexes for each example
+    label_str: list of lists of label strings for each example
+
+  Returns:
+    The number of the number of examples per class
+
+  The total of the class counts may be more than the number of examples
+  because an example may have multiple labels
+  """
+    
+  class_counts = collections.defaultdict(int)
+  for cl_list, cl_str_list in zip(labels_idx, labels_str):
+    for cl, cl_str in zip(cl_list, cl_str_list):
+      class_counts[(cl, cl_str)] += 1
+  for (cl, cl_str), count in sorted(class_counts.items()):
+    print(f'    class {cl_str} / {cl} : {count}')
+
+  return class_counts
+
