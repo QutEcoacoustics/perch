@@ -43,9 +43,9 @@ class ClassifyTest(parameterized.TestCase):
     data['embeddings'] = np.float32(
         rng.normal(size=(num_points, embedding_dim))
     )
-    data['label'] = rng.integers(0, num_classes, size=num_points)
+    data['label'] = [[l] for l in rng.integers(0, num_classes, size=num_points).tolist()]
     letters = 'abcdefghijklmnopqrstuvwxyz'
-    data['label_str'] = np.array(list(letters[i] for i in data['label']))
+    data['label_str'] = [[letters[i] for i in label_idxs] for label_idxs in data['label']]
     data['label_hot'] = np.zeros((num_points, num_classes), dtype=np.float32)
     for i, label in enumerate(data['label']):
       data['label_hot'][i, label] = 1.0

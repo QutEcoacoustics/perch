@@ -31,7 +31,7 @@ import dataclasses
 import itertools
 import pandas as pd
 import time
-from typing import DefaultDict, Dict, List, Sequence, Tuple
+from typing import DefaultDict, Dict, List, Sequence, Tuple, Union
 
 from chirp import audio_utils
 from chirp.inference import interface
@@ -75,7 +75,11 @@ class MergedDataset:
   """
 
   # The following are populated automatically from one of two classmethods.
-  data: Dict[str, np.ndarray]
+  # data has the following keys and types
+  # 'embeddings' (np.ndarray), 'filename' (np.ndarray of str), 'label' (list of list of int), 
+  # 'label_str' (list of list of str), 'label_hot' (np.ndarray)
+  # TODO: use a dataclass or typed dict for this to enforce the keys and types
+  data: Dict[str, Union[np.ndarray, List[List]]]
   num_classes: int
   embedding_dim: int
   labels: Tuple[str, ...]
@@ -208,9 +212,7 @@ class MergedDataset:
     )
 
 
-
-    if not merged and existing_merged is None:
-      raise ValueError('No embeddings or raw audio files found.')
+    if not merged and existing_merged is None:      raise ValueError('No embeddings or raw audio files found.')
 
     if not merged and existing_merged is not None:
       print('\nUsing existing embeddings for all audio source files.')
@@ -449,7 +451,9 @@ class MergedDataset:
     np.random.seed(seed)
     np.random.shuffle(locs)
 
+    # flatten labels only if self.data['label'] is a list of lists
     flattened_labels = [l for ex in self.data['label'] for l in ex]
+
     classes = set(flattened_labels)
     class_counts = {cl: flattened_labels.count(cl) for cl in classes}
     if train_examples_per_class is not None:

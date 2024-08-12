@@ -87,7 +87,7 @@ def create_source_infos(
   for pattern in source_file_patterns:
     #pattern can be either a string to glob or a 
     # already prepared glob
-    if type(pattern) is str:
+    if type(pattern) is str or type(pattern) is epath.gpath.PosixGPath:
       glob = epath.Path('').glob(pattern)
     elif type(pattern) is tuple:
       glob = Path(pattern[0]).rglob(pattern[1])
