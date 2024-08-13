@@ -85,12 +85,19 @@ def create_source_infos(
   """
   source_files = []
   for pattern in source_file_patterns:
-    #pattern can be either a string to glob or a 
-    # already prepared glob
+
+    # pattern can be either a tuple of (root, pattern) or a string/path
+    # if string/path, it can contain a delimiter to separate the root from the pattern
     if type(pattern) is str or type(pattern) is epath.gpath.PosixGPath:
-      glob = epath.Path('').glob(pattern)
+      if '://' in pattern:
+        root, pattern = pattern.split('://')
+        root = root + '://'
+      else:
+        root = ''
     elif type(pattern) is tuple:
-      glob = Path(pattern[0]).rglob(pattern[1])
+      root, pattern = pattern
+
+    glob = epath.Path(root).rglob(pattern)
     for source_file in glob:
       source_files.append(source_file)
 

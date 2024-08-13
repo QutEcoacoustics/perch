@@ -41,7 +41,7 @@ class BootstrapState:
     embedding_model: The model used to compute embeddings, loaded on init.
     embeddings_dataset: A TF Dataset of the embeddings, loaded on init.
     source_map: A Callable mapping file_id to full filepath.
-    baw_auth_token: Auth token for fetching Bioacoustic Workbench (e.g. A2O) data.
+    baw_auth_token: Auth token for fetching BAW/A2O data.
   """
 
   config: 'BootstrapConfig'
@@ -49,7 +49,7 @@ class BootstrapState:
   embeddings_dataset: tf.data.Dataset | None = None
   source_map: Callable[[str, float], str] | None = None
   baw_auth_token: str = ''
-  baw_domain: str = 'data.acousticsobervatory.org'
+  baw_domain: str = 'api.acousticsobervatory.org'
 
   def __post_init__(self):
     if self.embedding_model is None:
