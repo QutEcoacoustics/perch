@@ -85,7 +85,8 @@ class AgileModeling:
   results = None
   all_scores = None
 
-  # merged dataset
+  # merged dataset. This is called 'merged' because it's a merged
+  # dataset of new labelled examples and existing ones. 
   merged = None
 
   # custom classifier model
@@ -153,6 +154,16 @@ class AgileModeling:
     self.project_state = project_state
     self.separator = separator
 
+  def load_classifier(self):
+    """
+    Load the classifier model from the path specified in the config.
+    """
+    cfg = config_dict.ConfigDict({
+        'model_path': self.config.custom_classifier_path,
+        'logits_key': 'custom',
+    })
+    self.wrapped_model = interface.LogitsOutputHead.from_config(cfg)
+    
 
   def load_query_audio(self, 
                        audio_path,
@@ -513,6 +524,9 @@ class AgileModeling:
 
     #@markdown This cell writes detections (locations of audio windows where
     #@markdown the logit was greater than a threshold) to a CSV file.
+
+    if self.wrapped_model is None:
+      self.load_classifier()
     
     if output_filepath is None:
       output_filepath = Path(self.config.working_dir) / 'inference.csv'
@@ -536,7 +550,8 @@ class AgileModeling:
     classify.write_inference_csv(
         embeddings_ds=embeddings_ds,
         model=self.wrapped_model,
-        labels=self.merged.labels,
+        # labels=self.merged.labels was changed to this, in the case that we just load the classifier without training,
+        labels=self.wrapped_model.class_list.classes,
         output_filepath=output_filepath,
         threshold=class_thresholds,
         embedding_hop_size_s=self.bootstrap_config.embedding_hop_size_s,

@@ -188,11 +188,17 @@ def get_inference_dataset(
 ):
   """Create a dataset which includes the model's predictions."""
 
+  # we get this in different ways depending on whether the model is a 
+  # loaded saved model or not
+  model_input_dtype = get_model_input_dtype(model.logits_model)
+  
   def classify_batch(batch):
     """Classify a batch of embeddings."""
     emb = batch[tf_examples.EMBEDDING]
     emb_shape = tf.shape(emb)
     flat_emb = tf.reshape(emb, [-1, emb_shape[-1]])
+    if flat_emb.dtype != model_input_dtype:
+        flat_emb = tf.cast(flat_emb, model_input_dtype)
     logits = model.logits_model(flat_emb)
     logits = tf.reshape(
         logits, [emb_shape[0], emb_shape[1], tf.shape(logits)[-1]]
@@ -289,3 +295,35 @@ def calculate_lwlrap(true_labels, predicted_scores) -> float:
     # Calculate the overall score.
     overall_lwlrap = np.sum(sample_scores) / num_samples
     return overall_lwlrap
+
+
+def get_model_input_dtype(model):
+    methods = [
+        # For SavedModel
+        lambda m: getattr(m, 'logits_model', None) and 
+                 m.logits_model.signatures['serving_default'].inputs[0].dtype,
+        # For Keras Functional/Sequential
+        lambda m: getattr(m, 'inputs', None) and m.inputs[0].dtype,
+        # Alternative Keras method
+        lambda m: getattr(m, 'input_spec', None) and m.input_spec[0].dtype,
+        # Through first layer
+        lambda m: getattr(m, 'layers', None) and 
+                 m.layers[0].input_spec[0].dtype if m.layers else None,
+        # Through get_config
+        lambda m: getattr(m, 'get_config', None) and 
+                 m.get_config()['layers'][0]['config'].get('dtype')
+    ]
+    
+    errors = []
+    for method in methods:
+        try:
+            dtype = method(model)
+            if dtype is not None:
+                return dtype
+        except Exception as e:
+            errors.append(str(e))
+            continue
+    
+    raise ValueError(
+        f"Could not determine model input dtype. Tried {len(methods)} methods. "
+        f"Errors encountered: {'; '.join(errors)}")
