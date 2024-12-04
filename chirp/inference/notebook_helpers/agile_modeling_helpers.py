@@ -558,6 +558,27 @@ class AgileModeling:
         include_classes=include_classes,
         exclude_classes=exclude_classes)
     
+
+  def count_embeddings(self):
+    embeddings_ds = self.project_state.create_embeddings_dataset(shuffle_files=False)
+    embedding_count = 0
+    file_count = 0
+    month_counts = collections.defaultdict(int)
+    for idx, ex in enumerate(tqdm.tqdm(embeddings_ds.as_numpy_iterator())):
+      file_count += 1
+      embedding_count += ex['embedding'].shape[0]
+      if idx % 30 == 0:
+          yearmonth = ex['filename'].decode().split('/')[-1][:6]
+          month_counts[yearmonth] += 1
+
+    total_duration_hours = embedding_count * 5 / 3600
+    print(f'Found {total_duration_hours} hours of embeddings in {file_count} files.')
+    print('Month counts:')
+    for key in sorted(month_counts):
+        print(f"{key}: {month_counts[key]}")
+
+
+    
   
   def prepare_call_density_estimation(self, 
                                       target_class: str = None,
