@@ -17,30 +17,20 @@
 
 import base64
 from concurrent import futures
-import csv
 import dataclasses
 import json
 import threading
 from typing import Any, Sequence
 
-
-
-from chirp.projects.hoplite import interface as db_interface
 from etils import epath
 from ml_collections import config_dict
 import numpy as np
 import tensorflow as tf
 import tqdm
 
-
-from typing import Any
-
 from chirp.models import metrics
 from chirp.projects.agile2 import classifier_data
-import tqdm
-
-
-
+from chirp.projects.hoplite import interface as db_interface
 
 @dataclasses.dataclass
 class LinearClassifier:
@@ -249,8 +239,8 @@ def csv_worker_initializer(state: dict[str, Any]):
   state[name + 'db'] = state['db'].thread_split()
   filepath = epath.Path(state['filepath'])
   header = ['idx', 'dataset_name', 'source_id', 'offset', 'label', 'logits']
-  # if state['row_func'] is not None:
-  #   header += state['row_func']()
+  if state['row_func'] is not None:
+    header += state['row_func']()
   header = ','.join(header) + '\n'
 
   with filepath.open('w') as f:
@@ -278,8 +268,8 @@ def csv_worker_fn(
             lbl,
             logit[a],
         ]
-        # if state['row_func'] is not None:
-        #   row += state['row_func'](row)
+        if state['row_func'] is not None:
+          row += state['row_func'](row)
         f.write(','.join(map(str, row)) + '\n')
 
 
@@ -312,12 +302,10 @@ def write_inference_csv(
 ):
   """Write a CSV for all audio windows with logits above a threshold."""
 
-
   if labels is None:
     labels = linear_classifier.classes
   label_ids = {cl: i for i, cl in enumerate(linear_classifier.classes)}
   target_label_ids = np.array([label_ids[l] for l in labels])
-  #logits_fn = lambda emb: linear_classifier(emb)[target_label_ids]
   logits_fn = lambda batch_embs: linear_classifier(batch_embs)[
       :, target_label_ids
   ]
@@ -327,7 +315,7 @@ def write_inference_csv(
   state['db'] = db
   state['filepath'] = output_filepath
   state['threshold'] = threshold
-  #state['row_func'] = row_func
+  state['row_func'] = row_func
   emb_iter = batched_embedding_iterator(db, embedding_ids, batch_size=1024)
   detection_count = 0
   with futures.ThreadPoolExecutor(
@@ -345,5 +333,5 @@ def write_inference_csv(
       executor.submit(csv_worker_fn, kept_idxes, logits, state)
       detection_count += detections.sum()
 
-  print(f'Wrote {detection_count} detections to {output_filepath}')
+  print(f'Wrote {detection_count} detections from {len(embedding_ids)} to {output_filepath}')
 
