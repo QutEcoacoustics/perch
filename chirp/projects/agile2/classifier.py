@@ -16,29 +16,21 @@
 """Functions for training and applying a linear classifier."""
 
 import base64
-import csv
+from concurrent import futures
 import dataclasses
 import json
+import threading
 from typing import Any, Sequence
 
-
-
-from chirp.projects.hoplite import interface as db_interface
-#from hoplite.taxonomy import namespace
+from etils import epath
 from ml_collections import config_dict
 import numpy as np
 import tensorflow as tf
 import tqdm
 
-
-from typing import Any
-
 from chirp.models import metrics
 from chirp.projects.agile2 import classifier_data
-import tqdm
-
-
-
+from chirp.projects.hoplite import interface as db_interface
 
 @dataclasses.dataclass
 class LinearClassifier:
@@ -241,85 +233,105 @@ def train_linear_classifier(
   return linear_classifier, eval_scores
 
 
+def csv_worker_initializer(state: dict[str, Any]):
+  """Initialize the CSV worker."""
+  name = threading.current_thread().name
+  state[name + 'db'] = state['db'].thread_split()
+  filepath = epath.Path(state['filepath'])
+  header = ['idx', 'dataset_name', 'source_id', 'offset', 'label', 'logits']
+  if state['row_func'] is not None:
+    header += state['row_func']()
+  header = ','.join(header) + '\n'
+
+  with filepath.open('w') as f:
+    f.write(header)
+
+
+def csv_worker_fn(
+    emb_ids: np.ndarray, logits: np.ndarray, state: dict[str, Any]
+):
+  """Writes a CSV row for each detection."""
+  name = threading.current_thread().name
+  db = state[name + 'db']
+  labels = state['labels']
+  threshold = state['threshold']
+  with epath.Path(state['filepath']).open('a') as f:
+    for idx, logit in zip(emb_ids, logits):
+      source = db.get_embedding_source(idx)
+      for a in np.argwhere(logit > threshold):
+        lbl = labels[a[0]]
+        row = [
+            idx,
+            source.dataset_name,
+            source.source_id,
+            source.offsets[0],
+            lbl,
+            logit[a],
+        ]
+        if state['row_func'] is not None:
+          row += state['row_func'](row)
+        f.write(','.join(map(str, row)) + '\n')
+
+
+def batched_embedding_iterator(
+    db: db_interface.GraphSearchDBInterface,
+    embedding_ids: np.ndarray,
+    batch_size: int = 1024,
+):
+  """Iterate over embeddings in batches."""
+  q = 0
+  batch_ids = embedding_ids[q : q + batch_size]
+  batch_ids, batch_embs = db.get_embeddings(batch_ids)
+  for q in range(batch_size, len(embedding_ids), batch_size):
+    yield batch_ids, batch_embs
+    batch_ids = embedding_ids[q : q + batch_size]
+    batch_ids, batch_embs = db.get_embeddings(batch_ids)
+
+
+
+
+
 def write_inference_csv(
+    embedding_ids: np.ndarray,
     linear_classifier: LinearClassifier,
     db: db_interface.GraphSearchDBInterface,
     output_filepath: str,
     threshold: float,
     labels: Sequence[str] | None = None,
-    dataset: str | None = None,
     row_func: Any = None,
-    subset: float = 1,
 ):
-  """Write a CSV for all audio windows with logits above a threshold.
-
-  Args:
-    linear_classifier: Trained LinearClassifier to use for inference, containing beta, beta_bias, and classes.
-    db: GraphSearchDBInterface to read embeddings from.
-    output_filepath: Path to write the CSV to.
-    threshold: Logits must be above this value to be written.
-    labels: If provided, only write logits for these labels. If None, write
-      logits for all labels.
-    dataset: If provided, only write logits for embeddings from this dataset.
-    row_func: If provided, a function that returns additional columns to write. This function accepts an optional
-              argument, the row, and returns a list of values for additional columns. If the row is not provided, it will
-              return the header for the additional columns.
-
-  Returns:
-    None
-  """
-  idxes = db.get_embedding_ids(dataset=dataset)
-
-  if subset < 1:
-    n_samples = int(subset * len(idxes))
-    indices = np.arange(len(idxes))
-    np.random.shuffle(indices)
-    selected_indices = sorted(indices[:n_samples])
-    idxes = idxes[selected_indices]
-
+  """Write a CSV for all audio windows with logits above a threshold."""
 
   if labels is None:
     labels = linear_classifier.classes
   label_ids = {cl: i for i, cl in enumerate(linear_classifier.classes)}
   target_label_ids = np.array([label_ids[l] for l in labels])
-  logits_fn = lambda emb: linear_classifier(emb)[target_label_ids]
+  logits_fn = lambda batch_embs: linear_classifier(batch_embs)[
+      :, target_label_ids
+  ]
 
-  with open(output_filepath, 'w', newline='') as f:
-      writer = csv.writer(f)
-      # Write header
-      header = ['idx', 'dataset_name', 'source_id', 'offset', 'label', 'logits']
-      if row_func is not None:
-          header += row_func()
-      writer.writerow(header)
+  state = {}
+  state['labels'] = labels
+  state['db'] = db
+  state['filepath'] = output_filepath
+  state['threshold'] = threshold
+  state['row_func'] = row_func
+  emb_iter = batched_embedding_iterator(db, embedding_ids, batch_size=1024)
+  detection_count = 0
+  with futures.ThreadPoolExecutor(
+      max_workers=1,
+      initializer=csv_worker_initializer,
+      initargs=(state,),
+  ) as executor:
+    for batch_idxes, batch_embs in tqdm.tqdm(emb_iter):
+      logits = logits_fn(batch_embs)
+      # Filter out rows with no detections, avoiding extra database retrievals.
+      detections = logits > threshold
+      keep_rows = detections.max(axis=1)
+      logits = logits[keep_rows]
+      kept_idxes = batch_idxes[keep_rows]
+      executor.submit(csv_worker_fn, kept_idxes, logits, state)
+      detection_count += detections.sum()
 
-      detection_count = 0
-
-      if len(idxes) < 10000:
-          miniters = 1
-      elif len(idxes) < 100000:
-          miniters = 50
-      else:
-          miniters = 100
-      
-      # Write data
-      for idx in tqdm.tqdm(idxes, miniters=miniters):
-          source = db.get_embedding_source(idx)
-          emb = db.get_embedding(idx)
-          logits = logits_fn(emb)
-          for a in np.argwhere(logits > threshold):
-              detection_count += 1
-              lbl = labels[int(a)]
-              row = [
-                  idx,
-                  source.dataset_name,
-                  source.source_id,
-                  source.offsets[0],
-                  lbl,
-                  logits[a],
-              ]
-              if row_func is not None:
-                  row += row_func(row)
-              writer.writerow(row)
-
-  print(f'Wrote {detection_count} detections to {output_filepath}')
+  print(f'Wrote {detection_count} detections from {len(embedding_ids)} to {output_filepath}')
 
