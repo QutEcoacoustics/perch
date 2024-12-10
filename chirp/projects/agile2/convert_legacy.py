@@ -28,6 +28,7 @@ from etils import epath
 from pathlib import Path
 import numpy as np
 import pandas as pd
+import pyarrow
 import tensorflow as tf
 import tqdm
 
