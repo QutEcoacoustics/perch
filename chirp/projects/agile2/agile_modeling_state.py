@@ -526,6 +526,15 @@ class agile2_state:
 
     if subset <= 0 or subset > 1:
       raise ValueError('Subset must be between 0 and 1')
+    
+    embedding_ids = self.db.get_embedding_ids(dataset=dataset)
+
+    if subset < 1:
+      n_samples = int(subset * len(embedding_ids))
+      indices = np.arange(len(embedding_ids))
+      np.random.shuffle(indices)
+      selected_indices = sorted(indices[:n_samples])
+      embedding_ids = embedding_ids[selected_indices]
 
     if output_filepath is None:
       output_filepath = Path(self.config.predictions_folder) / 'inference.csv'
@@ -547,7 +556,7 @@ class agile2_state:
       site_id = site_lookup.get(int(arid), '')
       return [link, site_id]
         
-    classifier.write_inference_csv(self.classifier, self.db, output_filepath, threshold, labels, dataset, row_func=row_func, subset=subset)
+    classifier.write_inference_csv(embedding_ids, self.classifier, self.db, output_filepath, threshold, labels, row_func=row_func)
      
     
 
