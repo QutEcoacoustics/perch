@@ -60,7 +60,7 @@ class agile2_config:
   baw_config: dict = field(default_factory=dict)
 
   # name of the dataset in the database we are working with
-  search_dataset_name: str = 'search_dataset'
+  search_dataset_name: str = 'search_set'
 
   # path to the embeddings files to create the database from
   embeddings_folder: str = None
@@ -188,6 +188,10 @@ class agile2_state:
 
     query_uri = str(query_uri)
 
+    #xeno canto ids are uppercase on the website, audio loader requires lowercase
+    if query_uri.startswith('XC'):
+      query_uri = 'xc' + query_uri[2:]
+
     # if the query is a path relative to the self.conifg.labeled_examples_folder, resolve its full path
     if (self.config.labeled_examples_folder / Path(query_uri)).exists():
       query_uri = self.config.labeled_examples_folder / Path(query_uri)
@@ -258,7 +262,8 @@ class agile2_state:
         num_results=num_results,
         sample_size=sample_size,
         target_score=target_score,
-        dataset=dataset)
+        dataset=dataset,
+        exclude_labeled=True)
    
 
   def show_labeled_examples(self, label, label_type=1, num=5, dataset_name=None):
@@ -291,7 +296,8 @@ class agile2_state:
        edg.display(positive_labels=[])
 
 
-  def search(self, query, bias=0.0, num_results=50, sample_size=1_000_000, target_score=None, dataset=None):
+  def search(self, query, bias=0.0, num_results=50, sample_size=1_000_000, 
+             target_score=None, dataset=None, exclude_labeled=True):
     """
     Searches the db using a query or model
     query: np.array of shape (embedding_dim,) (the result of self.embedding_model.embed())
@@ -305,7 +311,7 @@ class agile2_state:
       return
     results, all_scores = brutalism.threaded_brute_search(
         self.db, query, num_results, score_fn=score_fn,
-        sample_size=sample_size, dataset=dataset)
+        sample_size=sample_size, dataset=dataset, exclude_labeled=exclude_labeled)
     self.search_results = results
     self.all_search_scores = all_scores
 
@@ -439,7 +445,8 @@ class agile2_state:
         num_results=num_results,
         sample_size=sample_size,
         target_score=target_score, 
-        dataset=dataset)
+        dataset=dataset,
+        exclude_labeled=True)
     
  
   def create_database(self, embeddings_files, overwrite=False):

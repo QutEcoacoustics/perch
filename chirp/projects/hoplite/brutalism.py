@@ -47,6 +47,7 @@ def threaded_brute_search(
     sample_size: int | float | None = None,
     rng_seed: int | None = None,
     dataset = None,
+    exclude_labeled = False,
 ) -> tuple[search_results.TopKSearchResults, np.ndarray]:
   """Performs a brute-force search for neighbors of the query embedding.
 
@@ -80,7 +81,7 @@ def threaded_brute_search(
       initializer=worker_initializer,
       initargs=(state,),
   ) as executor:
-    ids = get_brute_search_ids(db, sample_size, rng_seed, dataset=dataset)
+    ids = get_brute_search_ids(db, sample_size, rng_seed, dataset=dataset, exclude_labeled=exclude_labeled)
     futures = []
     for q in range(0, ids.shape[0], batch_size):
       futures.append(
@@ -109,6 +110,7 @@ def brute_search(
     sample_size: int | float | None = None,
     rng_seed: int | None = None,
     dataset = None,
+    exclude_labeled = False,
 ) -> tuple[search_results.TopKSearchResults, np.ndarray]:
   """Performs a brute-force search for neighbors of the query embedding.
 
@@ -128,7 +130,7 @@ def brute_search(
   """
   results = search_results.TopKSearchResults(search_list_size)
   all_scores = []
-  ids = get_brute_search_ids(db, sample_size, rng_seed, dataset=dataset)
+  ids = get_brute_search_ids(db, sample_size, rng_seed, dataset=dataset, exclude_labeled=exclude_labeled)
   for idx in ids:
     target_embedding = db.get_embedding(idx)
     score = score_fn(query_embedding, target_embedding)
@@ -146,9 +148,21 @@ def get_brute_search_ids(
     sample_size: int | float | None = None,
     rng_seed: int | None = None,
     dataset = None,
+    exclude_labeled = False,
 ):
   """Get IDs for brute force search, subsampling as needed."""
   ids = db.get_embedding_ids(dataset=dataset)
+  if exclude_labeled:
+    labels = db.get_classes()
+    exclude_ids = set()
+    for label in labels:
+      for label_type in [interface.LabelType.POSITIVE, interface.LabelType.NEGATIVE]:
+        exclude_ids = exclude_ids |  set(db.get_embeddings_by_label(label=label, label_type=label_type))
+    print(f'search size: {ids.shape}')
+    print(f'Excluding {len(exclude_ids)} labeled embeddings from search.')
+    ids = ids[~np.isin(ids, np.array(list(exclude_ids)))]
+    print(f'New search size: {ids.shape}')
+
   if sample_size is None:
     return ids
   if isinstance(sample_size, float):
